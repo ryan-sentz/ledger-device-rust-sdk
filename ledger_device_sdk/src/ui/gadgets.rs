@@ -69,6 +69,7 @@ pub fn clear_screen() {
 ///     ...
 /// }
 /// `
+#[cfg(not(feature = "io_new"))]
 pub fn display_pending_review(comm: &mut Comm) {
     clear_screen();
 
