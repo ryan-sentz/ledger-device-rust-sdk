@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `NbglHomeAndSettings::action`, `action_glyph` and `action_style` (with the new
+  `HomeActionStyle` enum) to display an action button on the home screen, via
+  the `action` parameter of `nbgl_useCaseHomeAndSettings`. This replaces the
+  deprecated `nbgl_useCaseHomeExt` C API.
+
 ## [1.37.0] - 2026-08-24
 
 ### Added

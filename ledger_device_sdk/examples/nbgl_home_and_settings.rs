@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use include_gif::include_gif;
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings, init_comm};
 // use ledger_device_sdk::nvm::*;
@@ -84,6 +85,14 @@ mod settings {
     }
 }
 
+/// Set when the home screen action button is pressed.
+static ACTION_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Called from NBGL event dispatch: only record the press, handle it in the main loop.
+fn on_action() {
+    ACTION_PRESSED.store(true, Ordering::Relaxed);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn sample_main() {
     let comm = init_comm(&COMM);
@@ -109,11 +118,17 @@ extern "C" fn sample_main() {
             "Example App",
             env!("CARGO_PKG_VERSION"),
             env!("CARGO_PKG_AUTHORS"),
-        );
+        )
+        .action("Press me", on_action);
 
     home.show_and_return();
 
     loop {
         let _ins = comm.next_command();
+
+        if ACTION_PRESSED.swap(false, Ordering::Relaxed) {
+            // React to the action button here, e.g. display another NBGL page. As
+            // `next_command` blocks, this runs once the next APDU has been received.
+        }
     }
 }

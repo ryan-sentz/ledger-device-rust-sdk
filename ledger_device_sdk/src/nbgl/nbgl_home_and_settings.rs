@@ -2,7 +2,8 @@
 //!
 //! Draws the extended version of home page of an app (page on which we land when launching it
 //! from dashboard) with automatic support of setting display.
-//! It enables to use an action button
+//! It enables to use an action button (see [NbglHomeAndSettings::action]), replacing the
+//! deprecated `nbgl_useCaseHomeExt` C API.
 use super::*;
 use crate::io::{Reply, StatusWords};
 use crate::io_callbacks::{nbgl_fetch_apdu_header, nbgl_reply_status};
@@ -13,6 +14,37 @@ static NVM_REF: AtomicPtr<AtomicStorage<[u8; SETTINGS_SIZE]>> =
     AtomicPtr::new(core::ptr::null_mut());
 static mut SWITCH_ARRAY: [nbgl_contentSwitch_t; SETTINGS_SIZE] =
     [unsafe { const_zero!(nbgl_contentSwitch_t) }; SETTINGS_SIZE];
+
+/// User callback invoked when the home screen action button is pressed.
+static mut HOME_ACTION_CB: Option<fn()> = None;
+
+/// Callback triggered by the NBGL API when the home screen action button is pressed.
+unsafe extern "C" fn home_action_cb() {
+    unsafe {
+        if let Some(cb) = HOME_ACTION_CB {
+            cb();
+        }
+    }
+}
+
+/// Style of the home screen action button.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HomeActionStyle {
+    /// Black button, implicating the main action of the app.
+    #[default]
+    Strong,
+    /// White button, more for extended features.
+    Soft,
+}
+
+impl From<HomeActionStyle> for nbgl_homeActionStyle_t {
+    fn from(style: HomeActionStyle) -> Self {
+        match style {
+            HomeActionStyle::Strong => STRONG_HOME_ACTION,
+            HomeActionStyle::Soft => SOFT_HOME_ACTION,
+        }
+    }
+}
 
 /// Callback triggered by the NBGL API when a setting switch is toggled.
 unsafe extern "C" fn settings_callback(token: c_int, _index: u8, _page: c_int) {
@@ -66,6 +98,10 @@ pub struct NbglHomeAndSettings {
     info_list: nbgl_contentInfoList_t,
     icon: nbgl_icon_details_t,
     start_page: PageIndex,
+    action_text: Option<CString>,
+    action_icon: Option<nbgl_icon_details_t>,
+    action_style: HomeActionStyle,
+    action: nbgl_homeAction_t,
 }
 
 impl SyncNBGL for NbglHomeAndSettings {}
@@ -97,6 +133,10 @@ impl NbglHomeAndSettings {
             info_list: nbgl_contentInfoList_t::default(),
             icon: nbgl_icon_details_t::default(),
             start_page: PageIndex::Home,
+            action_text: None,
+            action_icon: None,
+            action_style: HomeActionStyle::default(),
+            action: nbgl_homeAction_t::default(),
         }
     }
 
@@ -139,6 +179,58 @@ impl NbglHomeAndSettings {
     pub fn tagline(self, tagline: &str) -> NbglHomeAndSettings {
         NbglHomeAndSettings {
             tag_line: Some(CString::new(tagline).unwrap()),
+            ..self
+        }
+    }
+
+    /// Adds an action button to the home screen, displayed above the "Quit app" button.
+    ///
+    /// The button uses [HomeActionStyle::Strong] unless changed with
+    /// [NbglHomeAndSettings::action_style].
+    ///
+    /// `callback` is invoked from within NBGL event dispatch, so it must not call blocking NBGL
+    /// APIs (e.g. `show()`). Either set a flag (e.g. an `AtomicBool`) and react to it from the
+    /// application loop, or display another page with a non-blocking API. Note that with
+    /// `io_new`, `Comm::next_command` blocks until an APDU arrives, so a flag is only observed
+    /// once the next command is received.
+    ///
+    /// Only one home screen action callback is registered at a time; the most recently
+    /// configured one is used.
+    /// # Arguments
+    /// * `text` - The text of the action button.
+    /// * `callback` - The function to call when the action button is pressed.
+    /// # Returns
+    /// Returns the builder itself to allow method chaining.
+    pub fn action(self, text: &str, callback: fn()) -> NbglHomeAndSettings {
+        unsafe {
+            HOME_ACTION_CB = Some(callback);
+        }
+        NbglHomeAndSettings {
+            action_text: Some(CString::new(text).unwrap()),
+            ..self
+        }
+    }
+
+    /// Sets the icon to display in the home screen action button.
+    /// # Arguments
+    /// * `glyph` - The icon to display in the action button.
+    /// # Returns
+    /// Returns the builder itself to allow method chaining.
+    pub fn action_glyph(self, glyph: &NbglGlyph) -> NbglHomeAndSettings {
+        NbglHomeAndSettings {
+            action_icon: Some(glyph.into()),
+            ..self
+        }
+    }
+
+    /// Sets the style of the home screen action button.
+    /// # Arguments
+    /// * `style` - The style of the action button.
+    /// # Returns
+    /// Returns the builder itself to allow method chaining.
+    pub fn action_style(self, style: HomeActionStyle) -> NbglHomeAndSettings {
+        NbglHomeAndSettings {
+            action_style: style,
             ..self
         }
     }
@@ -186,6 +278,90 @@ impl NbglHomeAndSettings {
         self.start_page = page;
     }
 
+    /// Build the C structures referenced by `nbgl_useCaseHomeAndSettings`.
+    ///
+    /// These are stored in `self` because the C SDK keeps pointers to them while the home
+    /// screen is displayed, so `self` must not be moved after showing the screen.
+    fn prepare(&mut self) {
+        unsafe {
+            self.info_contents_ptr = self
+                .info_contents
+                .iter()
+                .map(|s| s.as_ptr())
+                .collect::<Vec<_>>();
+
+            self.info_list = nbgl_contentInfoList_t {
+                infoTypes: INFO_FIELDS.as_ptr(),
+                infoContents: self.info_contents_ptr[..].as_ptr(),
+                nbInfos: INFO_FIELDS.len() as u8,
+                infoExtensions: core::ptr::null(),
+                token: 0,
+                withExtensions: false,
+            };
+
+            for (i, setting) in self.setting_contents.iter().enumerate() {
+                SWITCH_ARRAY[i].text = setting[0].as_ptr();
+                SWITCH_ARRAY[i].subText = setting[1].as_ptr();
+                let ptr = NVM_REF.load(Ordering::Relaxed);
+                let state = if !ptr.is_null() {
+                    (&*ptr).get_ref()[i]
+                } else {
+                    OFF_STATE
+                };
+                SWITCH_ARRAY[i].initState = state;
+                SWITCH_ARRAY[i].token = (FIRST_USER_TOKEN + i as u32) as u8;
+                #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+                {
+                    SWITCH_ARRAY[i].tuneId = TuneIndex::TapCasual as u8;
+                }
+            }
+
+            self.content = nbgl_content_t {
+                content: nbgl_content_u {
+                    switchesList: nbgl_pageSwitchesList_s {
+                        switches: &raw const SWITCH_ARRAY as *const nbgl_contentSwitch_t,
+                        nbSwitches: self.nb_settings,
+                    },
+                },
+                contentActionCallback: Some(settings_callback),
+                type_: SWITCHES_LIST,
+            };
+
+            self.generic_contents = nbgl_genericContents_t {
+                callbackCallNeeded: false,
+                __bindgen_anon_1: nbgl_genericContents_t__bindgen_ty_1 {
+                    contentsList: &self.content as *const nbgl_content_t,
+                },
+                nbContents: 1,
+            };
+
+            self.action = match (&self.action_text, &self.action_icon) {
+                (None, None) => nbgl_homeAction_t::default(),
+                (text, icon) => nbgl_homeAction_t {
+                    text: match text {
+                        Some(t) => t.as_ptr(),
+                        None => core::ptr::null(),
+                    },
+                    icon: match icon {
+                        Some(i) => i as *const nbgl_icon_details_t,
+                        None => core::ptr::null(),
+                    },
+                    callback: Some(home_action_cb),
+                    style: self.action_style.into(),
+                },
+            };
+        }
+    }
+
+    /// Returns a pointer to the action button description, or null if no action is set.
+    fn action_ptr(&self) -> *const nbgl_homeAction_t {
+        if self.action_text.is_some() || self.action_icon.is_some() {
+            &self.action as *const nbgl_homeAction_t
+        } else {
+            core::ptr::null()
+        }
+    }
+
     /// Show the home screen and settings page (internal implementation).
     fn show_internal<T: TryFrom<ApduHeader>>(&mut self) -> Event<T>
     where
@@ -193,56 +369,7 @@ impl NbglHomeAndSettings {
     {
         unsafe {
             loop {
-                self.info_contents_ptr = self
-                    .info_contents
-                    .iter()
-                    .map(|s| s.as_ptr())
-                    .collect::<Vec<_>>();
-
-                self.info_list = nbgl_contentInfoList_t {
-                    infoTypes: INFO_FIELDS.as_ptr(),
-                    infoContents: self.info_contents_ptr[..].as_ptr(),
-                    nbInfos: INFO_FIELDS.len() as u8,
-                    infoExtensions: core::ptr::null(),
-                    token: 0,
-                    withExtensions: false,
-                };
-
-                for (i, setting) in self.setting_contents.iter().enumerate() {
-                    SWITCH_ARRAY[i].text = setting[0].as_ptr();
-                    SWITCH_ARRAY[i].subText = setting[1].as_ptr();
-                    let ptr = NVM_REF.load(Ordering::Relaxed);
-                    let state = if !ptr.is_null() {
-                        (&*ptr).get_ref()[i]
-                    } else {
-                        OFF_STATE
-                    };
-                    SWITCH_ARRAY[i].initState = state;
-                    SWITCH_ARRAY[i].token = (FIRST_USER_TOKEN + i as u32) as u8;
-                    #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
-                    {
-                        SWITCH_ARRAY[i].tuneId = TuneIndex::TapCasual as u8;
-                    }
-                }
-
-                self.content = nbgl_content_t {
-                    content: nbgl_content_u {
-                        switchesList: nbgl_pageSwitchesList_s {
-                            switches: &raw const SWITCH_ARRAY as *const nbgl_contentSwitch_t,
-                            nbSwitches: self.nb_settings,
-                        },
-                    },
-                    contentActionCallback: Some(settings_callback),
-                    type_: SWITCHES_LIST,
-                };
-
-                self.generic_contents = nbgl_genericContents_t {
-                    callbackCallNeeded: false,
-                    __bindgen_anon_1: nbgl_genericContents_t__bindgen_ty_1 {
-                        contentsList: &self.content as *const nbgl_content_t,
-                    },
-                    nbContents: 1,
-                };
+                self.prepare();
 
                 self.ux_sync_init();
                 nbgl_useCaseHomeAndSettings(
@@ -261,7 +388,7 @@ impl NbglHomeAndSettings {
                         _ => &self.generic_contents as *const nbgl_genericContents_t,
                     },
                     &self.info_list as *const nbgl_contentInfoList_t,
-                    core::ptr::null(),
+                    self.action_ptr(),
                     Some(quit_callback),
                 );
                 match self.ux_sync_wait(true) {
@@ -327,58 +454,9 @@ impl NbglHomeAndSettings {
     /// Show the home screen and settings page.
     /// This function returns immediately after the screen is displayed.
     pub fn show_and_return(&mut self) {
+        self.prepare();
+
         unsafe {
-            self.info_contents_ptr = self
-                .info_contents
-                .iter()
-                .map(|s| s.as_ptr())
-                .collect::<Vec<_>>();
-
-            self.info_list = nbgl_contentInfoList_t {
-                infoTypes: INFO_FIELDS.as_ptr(),
-                infoContents: self.info_contents_ptr[..].as_ptr(),
-                nbInfos: INFO_FIELDS.len() as u8,
-                infoExtensions: core::ptr::null(),
-                token: 0,
-                withExtensions: false,
-            };
-
-            for (i, setting) in self.setting_contents.iter().enumerate() {
-                SWITCH_ARRAY[i].text = setting[0].as_ptr();
-                SWITCH_ARRAY[i].subText = setting[1].as_ptr();
-                let ptr = NVM_REF.load(Ordering::Relaxed);
-                let state = if !ptr.is_null() {
-                    (&*ptr).get_ref()[i]
-                } else {
-                    OFF_STATE
-                };
-                SWITCH_ARRAY[i].initState = state;
-                SWITCH_ARRAY[i].token = (FIRST_USER_TOKEN + i as u32) as u8;
-                #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
-                {
-                    SWITCH_ARRAY[i].tuneId = TuneIndex::TapCasual as u8;
-                }
-            }
-
-            self.content = nbgl_content_t {
-                content: nbgl_content_u {
-                    switchesList: nbgl_pageSwitchesList_s {
-                        switches: &raw const SWITCH_ARRAY as *const nbgl_contentSwitch_t,
-                        nbSwitches: self.nb_settings,
-                    },
-                },
-                contentActionCallback: Some(settings_callback),
-                type_: SWITCHES_LIST,
-            };
-
-            self.generic_contents = nbgl_genericContents_t {
-                callbackCallNeeded: false,
-                __bindgen_anon_1: nbgl_genericContents_t__bindgen_ty_1 {
-                    contentsList: &self.content as *const nbgl_content_t,
-                },
-                nbContents: 1,
-            };
-
             nbgl_useCaseHomeAndSettings(
                 self.app_name.as_ptr() as *const c_char,
                 &self.icon as *const nbgl_icon_details_t,
@@ -395,7 +473,7 @@ impl NbglHomeAndSettings {
                     _ => &self.generic_contents as *const nbgl_genericContents_t,
                 },
                 &self.info_list as *const nbgl_contentInfoList_t,
-                core::ptr::null(),
+                self.action_ptr(),
                 Some(quit_cb),
             );
         }
