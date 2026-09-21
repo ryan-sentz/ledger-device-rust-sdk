@@ -18,10 +18,13 @@ pub mod nbgl_action;
 pub mod nbgl_address_review;
 pub mod nbgl_advance_review;
 pub mod nbgl_choice;
+pub mod nbgl_content;
 pub mod nbgl_generic_review;
 pub mod nbgl_generic_settings;
 pub mod nbgl_home_and_settings;
 pub mod nbgl_keypad;
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+pub mod nbgl_page;
 //pub mod nbgl_navigable_content;
 pub mod nbgl_review;
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
@@ -40,6 +43,8 @@ pub use nbgl_advance_review::*;
 #[doc(inline)]
 pub use nbgl_choice::*;
 #[doc(inline)]
+pub use nbgl_content::*;
+#[doc(inline)]
 pub use nbgl_generic_review::*;
 #[doc(inline)]
 pub use nbgl_generic_settings::*;
@@ -47,6 +52,9 @@ pub use nbgl_generic_settings::*;
 pub use nbgl_home_and_settings::*;
 #[doc(inline)]
 pub use nbgl_keypad::*;
+#[doc(inline)]
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+pub use nbgl_page::*;
 #[doc(inline)]
 pub use nbgl_review::*;
 //pub use nbgl_navigable_content::*; // integration issue
@@ -147,6 +155,13 @@ const DEFAULT_CONFIRM_KO_TEXT: &str = "Cancel";
 
 trait SyncNBGL: Sized {
     fn ux_sync_init(&self) {
+        // Every blocking widget draws into the single non-modal NBGL layout
+        // (`gLayout[0]`), displacing any live `NbglPage`. Bumping the counter
+        // here is what lets that page notice, so its `Drop` does not release a
+        // layout it no longer owns.
+        #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+        nbgl_page::PAGE_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+
         unsafe {
             G_RET = SyncNbgl::UxSyncRetError.into();
             G_ENDED = false;

@@ -454,6 +454,12 @@ impl NbglHomeAndSettings {
     /// Show the home screen and settings page.
     /// This function returns immediately after the screen is displayed.
     pub fn show_and_return(&mut self) {
+        // Takes over the single non-modal NBGL layout, displacing any live
+        // `NbglPage`. Unlike the blocking widgets this does not go through
+        // `SyncNBGL::ux_sync_init`, so the counter is bumped explicitly.
+        #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+        super::nbgl_page::PAGE_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+
         self.prepare();
 
         unsafe {
