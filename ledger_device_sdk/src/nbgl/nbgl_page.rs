@@ -719,3 +719,212 @@ impl NbglPage {
         self.show_internal(true)
     }
 }
+
+/// A non-blocking spinner page, drawn directly onto an NBGL layout.
+///
+/// [`NbglSpinner`](super::NbglSpinner) wraps `nbgl_useCaseSpinner`, which owns
+/// the `useCase` generic context and so cannot be mixed with [`NbglPage`].
+/// This is the page-layer equivalent: it builds the same spinner widget with
+/// [`nbgl_layoutAddSpinner`] and participates in the [`PAGE_GENERATION`]
+/// bookkeeping, so it coexists with the other pages and the blocking widgets.
+///
+/// It is built on the layout calls rather than `nbgl_pageDrawSpinner` because
+/// that function passes a null `subText`, and [`nbgl_layoutUpdateSpinner`] then
+/// refuses later subText updates — it requires the spinner container to have
+/// been built with three children. A spinner that should ever show a subText
+/// must therefore be created with one.
+///
+/// # Lifetime
+///
+/// As with [`NbglPage`], NBGL stores the string pointers it is given rather
+/// than copying, so this value must stay alive for as long as the spinner is
+/// displayed.
+///
+/// # Animation
+///
+/// The spinner turns by itself: `nbgl_layoutAddSpinner` registers a 400ms
+/// ticker with NBGL, which advances it for as long as the application's event
+/// loop keeps running. [`update`](NbglSpinnerPage::update) also advances it,
+/// matching `nbgl_useCaseSpinner`. [`tick`](NbglSpinnerPage::tick) is only
+/// needed to drive the animation manually, and most callers do not need it.
+pub struct NbglSpinnerPage {
+    /// Double-buffered so an update always presents a *different* pointer to
+    /// NBGL; see [`update`](NbglSpinnerPage::update).
+    text: [CString; 2],
+    sub_text: [CString; 2],
+    idx: usize,
+
+    /// Current spinner position, in `0..NB_SPINNER_POSITIONS`.
+    position: u8,
+
+    /// Handle from `nbgl_layoutGet`; null when not drawn.
+    handle: *mut nbgl_layout_t,
+    /// Value of [`PAGE_GENERATION`] at draw time.
+    generation: u32,
+}
+
+impl Default for NbglSpinnerPage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NbglSpinnerPage {
+    /// Creates a new spinner page. Nothing is drawn until
+    /// [`draw`](NbglSpinnerPage::draw) is called.
+    pub fn new() -> NbglSpinnerPage {
+        NbglSpinnerPage {
+            text: [CString::default(), CString::default()],
+            sub_text: [CString::default(), CString::default()],
+            idx: 0,
+            position: 0,
+            handle: core::ptr::null_mut(),
+            generation: 0,
+        }
+    }
+
+    /// Stores `text` / `sub_text` in the buffer slot NBGL is not currently
+    /// reading, and returns pointers to them.
+    ///
+    /// NBGL detects a text change by comparing the bytes behind the new pointer
+    /// with the bytes behind the one it holds. Rewriting the live buffer in
+    /// place would always compare equal, so the screen would never be redrawn —
+    /// hence the flip.
+    fn stage(&mut self, text: &str, sub_text: &str) -> (*const c_char, *const c_char) {
+        let next = (self.idx + 1) % 2;
+        self.text[next] = CString::new(text).unwrap();
+        self.sub_text[next] = CString::new(sub_text).unwrap();
+        self.idx = next;
+
+        (
+            self.text[next].as_ptr() as *const c_char,
+            self.sub_text[next].as_ptr() as *const c_char,
+        )
+    }
+
+    /// Draws the spinner and returns immediately.
+    ///
+    /// Any previously drawn instance is released first.
+    pub fn draw(&mut self, text: &str, sub_text: &str) -> Result<(), NbglPageError> {
+        self.release();
+
+        let (text, sub_text) = self.stage(text, sub_text);
+
+        // `withLeftBorder` matches what `nbgl_pageDrawSpinner` and
+        // `nbgl_useCaseSpinner` request for their layouts.
+        let description = nbgl_layoutDescription_t {
+            withLeftBorder: true,
+            ..Default::default()
+        };
+
+        // SAFETY: `description` is only read for the duration of the call, and
+        // both strings are owned by `self`, which outlives the drawn spinner
+        // because `Drop` releases it.
+        let handle = unsafe {
+            let handle = nbgl_layoutGet(&description as *const nbgl_layoutDescription_t);
+            if handle.is_null() {
+                return Err(NbglPageError::DrawFailed);
+            }
+
+            nbgl_layoutAddSpinner(handle, text, sub_text, self.position);
+            nbgl_layoutDraw(handle);
+            nbgl_refreshSpecial(FULL_COLOR_PARTIAL_REFRESH);
+
+            handle
+        };
+
+        self.handle = handle;
+        self.generation = PAGE_GENERATION
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+
+        Ok(())
+    }
+
+    /// Updates the displayed text without redrawing the whole page.
+    ///
+    /// Also advances the spinner, as `nbgl_useCaseSpinner` does on each call.
+    /// `nbgl_layoutUpdateSpinner` takes an absolute position and moves the
+    /// spinner to it, so passing an unchanged value would pin the animation
+    /// and undo NBGL's ticker.
+    ///
+    /// Does nothing if the spinner is not currently live — redraw with
+    /// [`draw`](NbglSpinnerPage::draw) in that case.
+    pub fn update(&mut self, text: &str, sub_text: &str) {
+        if !self.is_live() {
+            return;
+        }
+
+        self.position = (self.position + 1) % NB_SPINNER_POSITIONS as u8;
+
+        let (text, sub_text) = self.stage(text, sub_text);
+        self.refresh(text, sub_text);
+    }
+
+    /// Advances the spinner by one position.
+    ///
+    /// Not normally needed — NBGL turns the spinner on its own ticker. Use
+    /// this only to drive the animation manually.
+    ///
+    /// Does nothing if the spinner is not currently live.
+    pub fn tick(&mut self) {
+        if !self.is_live() {
+            return;
+        }
+
+        self.position = (self.position + 1) % NB_SPINNER_POSITIONS as u8;
+
+        let (text, sub_text) = (
+            self.text[self.idx].as_ptr() as *const c_char,
+            self.sub_text[self.idx].as_ptr() as *const c_char,
+        );
+        self.refresh(text, sub_text);
+    }
+
+    /// Pushes the current text and position into the live layout, refreshing
+    /// the screen as `nbgl_useCaseSpinner` does: a fast black and white refresh
+    /// when only the spinner moved, a partial colour refresh when text changed.
+    fn refresh(&mut self, text: *const c_char, sub_text: *const c_char) {
+        // SAFETY: `handle` is live (checked by the callers), and both pointers
+        // target allocations owned by `self`.
+        unsafe {
+            match nbgl_layoutUpdateSpinner(self.handle, text, sub_text, self.position) {
+                1 => nbgl_refreshSpecial(BLACK_AND_WHITE_FAST_REFRESH),
+                2 => nbgl_refreshSpecial(FULL_COLOR_PARTIAL_REFRESH),
+                _ => (),
+            }
+        }
+    }
+
+    /// Whether this spinner still owns the screen.
+    ///
+    /// Becomes `false` once another page or a blocking widget has drawn over
+    /// it, at which point [`draw`](NbglSpinnerPage::draw) restores it.
+    pub fn is_live(&self) -> bool {
+        !self.handle.is_null() && PAGE_GENERATION.load(Ordering::Acquire) == self.generation
+    }
+
+    /// Releases the spinner. Idempotent, and called automatically by [`Drop`].
+    pub fn release(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+
+        // Only release while we still own the single background layout;
+        // otherwise the handle now refers to someone else's layout.
+        if PAGE_GENERATION.load(Ordering::Acquire) == self.generation {
+            // SAFETY: `handle` came from a successful `nbgl_layoutGet`, has not
+            // been released, and the generation check confirms it is still ours.
+            unsafe { nbgl_layoutRelease(self.handle) };
+            // No redraw: the caller decides what replaces this page.
+        }
+
+        self.handle = core::ptr::null_mut();
+    }
+}
+
+impl Drop for NbglSpinnerPage {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
